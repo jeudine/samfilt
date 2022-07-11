@@ -1,0 +1,18 @@
+[package]
+name = "samfilt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Julien Eudine <julien@eudine.fr>"]
+description = "A filtering tool for Sequence Alignment/Map files."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jeudine/samfilt"
+categories = ["science", "command-line-utilities"]
+
+
+[dependencies]
+getopts = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
