@@ -20,6 +20,18 @@ fn main() {
 		"reads with supplementary alignments",
 		"sel|del",
 	);
+	opts.optopt(
+		"",
+		"greater_len",
+		"reads with a greater length than UINT [0]",
+		"UINT",
+	);
+	opts.optopt(
+		"",
+		"smaller_len",
+		"reads with a smaller length than UINT [4294967295]",
+		"UINT",
+	);
 	opts.optopt("o", "", "output to FILE [stdout]", "FILE");
 
 	let matches = match opts.parse(&args[1..]) {
@@ -36,14 +48,34 @@ fn main() {
 		return;
 	}
 
-	let mut param: FilterParam = Default::default();
-
-	param.supplementary = match matches.opt_get_default("supplementary", Mode::No) {
+	let supplementary = match matches.opt_get_default("supplementary", Mode::No) {
 		Ok(m) => m,
 		Err(err) => {
 			eprintln!("[ERROR] {}: 'supplementary'", err);
 			process::exit(1);
 		}
+	};
+
+	let greater_len = match matches.opt_get_default("greater_len", 0) {
+		Ok(m) => m,
+		Err(err) => {
+			eprintln!("[ERROR] {}: 'greater_len'", err);
+			process::exit(1);
+		}
+	};
+
+	let smaller_len = match matches.opt_get_default("smaller_len", u32::MAX) {
+		Ok(m) => m,
+		Err(err) => {
+			eprintln!("[ERROR] {}: 'smaller_len'", err);
+			process::exit(1);
+		}
+	};
+
+	let param = FilterParam {
+		supplementary: supplementary,
+		greater_len: greater_len,
+		smaller_len: smaller_len,
 	};
 
 	if matches.free.len() != 1 {
@@ -81,9 +113,8 @@ fn print_usage(program: &str, opts: Options) {
 	print!("{}", opts.usage(&brief));
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-	#[default]
 	No,
 	Sel,
 	Del,
@@ -103,13 +134,16 @@ impl FromStr for Mode {
 	}
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct FilterParam {
 	supplementary: Mode,
+	greater_len: u32,
+	smaller_len: u32,
 }
 
 struct ReadSpec {
 	has_supplementary: bool,
+	len: u32,
 }
 
 fn filter(input: &File, output: &mut dyn io::Write, param: FilterParam) {
@@ -118,6 +152,7 @@ fn filter(input: &File, output: &mut dyn io::Write, param: FilterParam) {
 	let mut line_buf: Vec<String> = Vec::new();
 	let mut spec = ReadSpec {
 		has_supplementary: false,
+		len: 0,
 	};
 	for line in reader.lines() {
 		let line = match line {
@@ -136,22 +171,24 @@ fn filter(input: &File, output: &mut dyn io::Write, param: FilterParam) {
 			}
 		} else {
 			let flag: u16 = field[1].parse().unwrap();
-			if name_buf.eq(name) {
+			if name_buf == name {
 				if (flag & 2048) != 0 {
 					spec.has_supplementary = true;
 				}
 			} else {
-				if !name_buf.eq("") {
+				if name_buf != "" {
 					write_filter(&line_buf, &spec, &param, output);
 				}
 				name_buf = name.to_string();
 				spec.has_supplementary = false;
+				spec.len = field[9].len() as u32;
+				//println!("{:?}: {:?}", name_buf, spec.len);
 				line_buf.clear();
 			}
 			line_buf.push(line.to_string());
 		}
 	}
-	if !name_buf.eq("") {
+	if name_buf != "" {
 		write_filter(&line_buf, &spec, &param, output);
 	}
 }
@@ -163,19 +200,23 @@ fn write_filter(
 	param: &FilterParam,
 	output: &mut dyn io::Write,
 ) {
-	match param.supplementary {
-		Mode::No => write_sam(lines, output),
-		Mode::Sel => {
-			if spec.has_supplementary {
-				write_sam(lines, output);
-			}
-		}
-		Mode::Del => {
-			if !spec.has_supplementary {
-				write_sam(lines, output);
-			}
-		}
-	};
+	if param.supplementary == Mode::Sel && !spec.has_supplementary {
+		return;
+	}
+
+	if param.supplementary == Mode::Del && spec.has_supplementary {
+		return;
+	}
+
+	if param.greater_len >= spec.len {
+		return;
+	}
+
+	if param.smaller_len <= spec.len {
+		return;
+	}
+
+	write_sam(lines, output);
 }
 
 #[inline]
