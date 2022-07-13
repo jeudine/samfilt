@@ -3,7 +3,7 @@ use getopts::Options;
 use std::env::args;
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process;
 use std::str::FromStr;
@@ -32,6 +32,20 @@ fn main() {
 		"reads with a smaller length than UINT [4294967295]",
 		"UINT",
 	);
+	opts.optopt(
+		"",
+		"qname_input",
+		"alignment records with QNAME being equal to one of the lines in FILE",
+		"FILE",
+	);
+
+	opts.optopt(
+		"",
+		"qname_output",
+		"output the QNAME field of all the records in the filtered SAM file (one per line)",
+		"FILE",
+	);
+
 	opts.optopt("o", "", "output to FILE [stdout]", "FILE");
 
 	let matches = match opts.parse(&args[1..]) {
@@ -72,10 +86,53 @@ fn main() {
 		}
 	};
 
-	let param = FilterParam {
+	let qname_input = match matches.opt_str("qname_input") {
+		Some(ref p) => {
+			let path = Path::new(p);
+			let file = match File::open(&path) {
+				Ok(file) => file,
+				Err(err) => {
+					eprintln!("[ERROR] open: {} {}", path.display(), err);
+					process::exit(1);
+				}
+			};
+			let reader = BufReader::new(&file);
+			Some(
+				reader
+					.lines()
+					.map(|line| match line {
+						Ok(l) => l,
+						Err(err) => {
+							eprintln!("[ERROR] line: {}", err);
+							process::exit(1);
+						}
+					})
+					.collect(),
+			)
+		}
+		None => None,
+	};
+
+	let qname_output = match matches.opt_str("qname_output") {
+		Some(ref p) => {
+			let path = Path::new(p);
+			match File::create(&path) {
+				Ok(file) => Some(file),
+				Err(err) => {
+					eprintln!("[ERROR] create: {} {}", path.display(), err);
+					process::exit(1);
+				}
+			}
+		}
+		None => None,
+	};
+
+	let mut param = FilterParam {
 		supplementary: supplementary,
 		greater_len: greater_len,
 		smaller_len: smaller_len,
+		qname_input: qname_input,
+		qname_output: qname_output,
 	};
 
 	if matches.free.len() != 1 {
@@ -105,7 +162,7 @@ fn main() {
 		}
 		None => Box::new(io::stdout()),
 	};
-	filter(&input, &mut *output, param);
+	filter(&input, &mut *output, &mut param);
 }
 
 fn print_usage(program: &str, opts: Options) {
@@ -134,23 +191,25 @@ impl FromStr for Mode {
 	}
 }
 
-#[derive(Clone, Copy)]
 struct FilterParam {
 	supplementary: Mode,
 	greater_len: u32,
 	smaller_len: u32,
+	qname_input: Option<Vec<String>>,
+	qname_output: Option<File>,
 }
 
-struct ReadSpec {
+struct Read {
+	qname: String,
 	has_supplementary: bool,
 	len: u32,
 }
 
-fn filter(input: &File, output: &mut dyn io::Write, param: FilterParam) {
+fn filter(input: &File, output: &mut dyn io::Write, mut param: &mut FilterParam) {
 	let reader = BufReader::new(input);
-	let mut name_buf = "".to_string();
 	let mut line_buf: Vec<String> = Vec::new();
-	let mut spec = ReadSpec {
+	let mut read = Read {
+		qname: "".to_string(),
 		has_supplementary: false,
 		len: 0,
 	};
@@ -171,58 +230,82 @@ fn filter(input: &File, output: &mut dyn io::Write, param: FilterParam) {
 			}
 		} else {
 			let flag: u16 = field[1].parse().unwrap();
-			if name_buf == name {
+			if read.qname == name {
 				if (flag & 2048) != 0 {
-					spec.has_supplementary = true;
+					read.has_supplementary = true;
 				}
 			} else {
-				if name_buf != "" {
-					write_filter(&line_buf, &spec, &param, output);
+				if read.qname != "" {
+					write_filter(&line_buf, &read, &mut param, output);
 				}
-				name_buf = name.to_string();
-				spec.has_supplementary = false;
-				spec.len = field[9].len() as u32;
-				//println!("{:?}: {:?}", name_buf, spec.len);
+				read.qname = name.to_string();
+				read.has_supplementary = false;
+				read.len = field[9].len() as u32;
 				line_buf.clear();
 			}
 			line_buf.push(line.to_string());
 		}
 	}
-	if name_buf != "" {
-		write_filter(&line_buf, &spec, &param, output);
+	if read.qname != "" {
+		write_filter(&line_buf, &read, &mut param, output);
 	}
 }
 
 #[inline]
 fn write_filter(
 	lines: &Vec<String>,
-	spec: &ReadSpec,
-	param: &FilterParam,
+	read: &Read,
+	param: &mut FilterParam,
 	output: &mut dyn io::Write,
 ) {
-	if param.supplementary == Mode::Sel && !spec.has_supplementary {
+	//println!("{:?}: {:?}", read.qname, read.len);
+	if let Some(ref qname_input) = param.qname_input {
+		let mut is_present = false;
+		for name in qname_input {
+			if read.qname == *name {
+				is_present = true;
+				break;
+			}
+		}
+		if !is_present {
+			return;
+		}
+	}
+
+	if param.supplementary == Mode::Sel && !read.has_supplementary {
 		return;
 	}
 
-	if param.supplementary == Mode::Del && spec.has_supplementary {
+	if param.supplementary == Mode::Del && read.has_supplementary {
 		return;
 	}
 
-	if param.greater_len >= spec.len {
+	if param.greater_len >= read.len {
 		return;
 	}
 
-	if param.smaller_len <= spec.len {
+	if param.smaller_len <= read.len {
 		return;
 	}
 
-	write_sam(lines, output);
+	write_sam(lines, output, &mut param.qname_output, &read.qname);
 }
 
 #[inline]
-fn write_sam(lines: &Vec<String>, output: &mut dyn io::Write) {
+fn write_sam(
+	lines: &Vec<String>,
+	output: &mut dyn io::Write,
+	qname_output: &mut Option<File>,
+	qname: &str,
+) {
 	for line in lines {
 		if let Err(err) = writeln!(output, "{}", line) {
+			eprintln!("[ERROR] write {}", err);
+			process::exit(1);
+		}
+	}
+	if let Some(file) = qname_output {
+		if let Err(err) = writeln!(file, "{}", qname) {
 			eprintln!("[ERROR] write {}", err);
 			process::exit(1);
 		}
